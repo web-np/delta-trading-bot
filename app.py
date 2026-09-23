@@ -9,18 +9,25 @@ import time
 import json
 from datetime import datetime
 
-st.set_page_config(page_title="Delta Live WebUI Trader", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Delta Range Filter Trader", page_icon="📈", layout="wide")
 
 # Session State Setup
 if "auto_trade" not in st.session_state:
     st.session_state.auto_trade = False
 
+if "rf_enabled" not in st.session_state:
+    st.session_state.rf_enabled = True
+
+if "rf_period" not in st.session_state:
+    st.session_state.rf_period = 100
+
+if "rf_mult" not in st.session_state:
+    st.session_state.rf_mult = 3.0
+
 if "indicators" not in st.session_state:
     st.session_state.indicators = [
-        {"id": 1, "type": "EMA", "param": 9, "color": "#FFFFFF"},
-        {"id": 2, "type": "EMA", "param": 20, "color": "#FFEB3B"},
-        {"id": 3, "type": "EMA", "param": 50, "color": "#FF9800"},
-        {"id": 4, "type": "EMA", "param": 200, "color": "#4CAF50"}
+        {"id": 1, "type": "EMA", "param": 9, "color": "#FFEB3B"},
+        {"id": 2, "type": "EMA", "param": 21, "color": "#FF9800"}
     ]
 
 # Delta Exchange API Logic
@@ -51,7 +58,7 @@ def get_delta_balance(api_key, api_secret):
 
 def fetch_candles(symbol="BTCUSD", resolution="1m"):
     end_time = int(time.time())
-    start_time = end_time - (3600 * 3)  # Last 3 hours
+    start_time = end_time - (3600 * 5)  # 5 hours data for accurate Range Filter EMA
     url = f"{DELTA_BASE_URL}/v2/chart/history?symbol={symbol}&resolution={resolution}&start={start_time}&end={end_time}"
     try:
         res = requests.get(url, timeout=3).json()
@@ -63,20 +70,20 @@ def fetch_candles(symbol="BTCUSD", resolution="1m"):
     except Exception:
         pass
 
-    # Simulation fallback with strictly ordered Unix timestamps (seconds)
+    # Fallback simulation
     now = int(time.time()) - 60
-    base_time = now - (100 * 60)
-    times = [base_time + (i * 60) for i in range(100)]
+    base_time = now - (150 * 60)
+    times = [base_time + (i * 60) for i in range(150)]
     
     np.random.seed(42)
-    noise = np.cumsum(np.random.randn(100) * 2.0)
-    base_price = 2675.0 + noise
+    noise = np.cumsum(np.random.randn(150) * 4.0)
+    base_price = 68000.0 + noise
 
     opens = base_price
-    highs = base_price + np.random.uniform(0.5, 4.0, 100)
-    lows = base_price - np.random.uniform(0.5, 4.0, 100)
-    closes = base_price + np.random.uniform(-2.0, 2.0, 100)
-    vols = np.random.randint(100, 1800, 100)
+    highs = base_price + np.random.uniform(5.0, 25.0, 150)
+    lows = base_price - np.random.uniform(5.0, 25.0, 150)
+    closes = base_price + np.random.uniform(-15.0, 15.0, 150)
+    vols = np.random.randint(100, 1800, 150)
 
     return pd.DataFrame({
         "time": times,
@@ -86,6 +93,79 @@ def fetch_candles(symbol="BTCUSD", resolution="1m"):
         "close": closes,
         "volume": vols
     })
+
+# --- PineScript to Python Conversion: Range Filter ---
+def calculate_range_filter(df, per=100, mult=3.0):
+    src = df['close'].values
+    n = len(src)
+    if n < 2:
+        return df
+
+    # Smooth Range: avrng = ta.ema(abs(x - x[1]), t), smoothrng = ta.ema(avrng, wper) * m
+    diff = np.abs(np.diff(src, prepend=src[0]))
+    diff_s = pd.Series(diff)
+    wper = per * 2 - 1
+    avrng = diff_s.ewm(span=per, adjust=False).mean()
+    smrng = (avrng.ewm(span=wper, adjust=False).mean() * mult).values
+
+    # Range Filter calculation loop
+    filt = np.zeros(n)
+    filt[0] = src[0]
+    for i in range(1, n):
+        prev_f = filt[i - 1]
+        r = smrng[i]
+        x = src[i]
+        if x > prev_f:
+            filt[i] = prev_f if (x - r < prev_f) else (x - r)
+        else:
+            filt[i] = prev_f if (x + r > prev_f) else (x + r)
+
+    # Direction
+    upward = np.zeros(n)
+    downward = np.zeros(n)
+    for i in range(1, n):
+        if filt[i] > filt[i - 1]:
+            upward[i] = upward[i - 1] + 1
+            downward[i] = 0
+        elif filt[i] < filt[i - 1]:
+            downward[i] = downward[i - 1] + 1
+            upward[i] = 0
+        else:
+            upward[i] = upward[i - 1]
+            downward[i] = downward[i - 1]
+
+    # Target Bands
+    hband = filt + smrng
+    lband = filt - smrng
+
+    # Breakouts & Signals
+    long_cond = np.zeros(n, dtype=bool)
+    short_cond = np.zeros(n, dtype=bool)
+    for i in range(1, n):
+        long_cond[i] = (src[i] > filt[i] and upward[i] > 0)
+        short_cond[i] = (src[i] < filt[i] and downward[i] > 0)
+
+    cond_ini = np.zeros(n)
+    for i in range(1, n):
+        if long_cond[i]:
+            cond_ini[i] = 1
+        elif short_cond[i]:
+            cond_ini[i] = -1
+        else:
+            cond_ini[i] = cond_ini[i - 1]
+
+    long_condition = np.zeros(n, dtype=bool)
+    short_condition = np.zeros(n, dtype=bool)
+    for i in range(1, n):
+        long_condition[i] = (long_cond[i] and cond_ini[i - 1] == -1)
+        short_condition[i] = (short_cond[i] and cond_ini[i - 1] == 1)
+
+    df['rf_filt'] = filt
+    df['rf_hband'] = hband
+    df['rf_lband'] = lband
+    df['rf_buy'] = long_condition
+    df['rf_sell'] = short_condition
+    return df
 
 # --- Sidebar Controls ---
 st.sidebar.title("⚙️ Delta Config")
@@ -102,9 +182,16 @@ else:
     st.sidebar.info("○ BOT PAUSED")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("📈 Indicator Settings")
+st.sidebar.subheader("🎯 Range Filter Indicator")
+st.session_state.rf_enabled = st.sidebar.checkbox("Enable Range Filter (Buy/Sell)", value=st.session_state.rf_enabled)
+if st.session_state.rf_enabled:
+    st.session_state.rf_period = st.sidebar.number_input("Sampling Period", min_value=1, max_value=300, value=st.session_state.rf_period)
+    st.session_state.rf_mult = st.sidebar.number_input("Range Multiplier", min_value=0.1, max_value=10.0, value=st.session_state.rf_mult, step=0.1)
 
-with st.sidebar.expander("➕ Add New Indicator", expanded=False):
+st.sidebar.markdown("---")
+st.sidebar.subheader("📈 Additional Indicators")
+
+with st.sidebar.expander("➕ Add EMA / SMA", expanded=False):
     ind_type = st.selectbox("Type", ["EMA", "SMA"])
     ind_param = st.number_input("Length", min_value=2, max_value=200, value=20)
     ind_color = st.color_picker("Color", "#00E676")
@@ -132,12 +219,17 @@ c2.metric("Pair", symbol)
 c3.metric("Auto Trade", "ON" if st.session_state.auto_trade else "OFF")
 c4.metric("Last Sync", datetime.now().strftime("%H:%M:%S"))
 
-# Data Preparation
+# Candle & Indicator Preparation
 df = fetch_candles(symbol)
 
-# Format Candlestick & Volume Data
+# Calculate Range Filter if enabled
+if st.session_state.rf_enabled:
+    df = calculate_range_filter(df, per=st.session_state.rf_period, mult=st.session_state.rf_mult)
+
 candle_data = []
 volume_data = []
+markers_data = []
+
 for _, row in df.iterrows():
     t_sec = int(row["time"])
     o = round(float(row["open"]), 2)
@@ -150,7 +242,26 @@ for _, row in df.iterrows():
     vol_color = "rgba(38, 166, 154, 0.55)" if c >= o else "rgba(239, 83, 80, 0.55)"
     volume_data.append({"time": t_sec, "value": v, "color": vol_color})
 
-# Format Indicators
+    # Range Filter Buy / Sell Markers
+    if st.session_state.rf_enabled:
+        if row.get('rf_buy'):
+            markers_data.append({
+                "time": t_sec,
+                "position": "belowBar",
+                "color": "#00E676",
+                "shape": "arrowUp",
+                "text": "BUY"
+            })
+        elif row.get('rf_sell'):
+            markers_data.append({
+                "time": t_sec,
+                "position": "aboveBar",
+                "color": "#2962FF",
+                "shape": "arrowDown",
+                "text": "SELL"
+            })
+
+# Additional Indicators calculation
 indicator_series = []
 for ind in st.session_state.indicators:
     t = ind["type"]
@@ -176,11 +287,35 @@ for ind in st.session_state.indicators:
             "data": line_points
         })
 
+# Range Filter Line Series
+rf_series = []
+if st.session_state.rf_enabled and 'rf_filt' in df:
+    rf_series.append({
+        "name": "Range Filter",
+        "color": "#90bff9",
+        "lineWidth": 2,
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_filt"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_filt"])]
+    })
+    rf_series.append({
+        "name": "High Target",
+        "color": "rgba(255, 255, 255, 0.5)",
+        "lineWidth": 1,
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_hband"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_hband"])]
+    })
+    rf_series.append({
+        "name": "Low Target",
+        "color": "rgba(41, 98, 255, 0.5)",
+        "lineWidth": 1,
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_lband"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_lband"])]
+    })
+
 candle_json = json.dumps(candle_data)
 volume_json = json.dumps(volume_data)
+markers_json = json.dumps(markers_data)
 indicators_json = json.dumps(indicator_series)
+rf_json = json.dumps(rf_series)
 
-# HTML/JS with Pinned Lightweight-Charts Version 4.1.1
+# HTML/JS with Lightweight-Charts 4.1.1 + Markers
 tv_chart_html = f"""
 <!DOCTYPE html>
 <html>
@@ -219,6 +354,7 @@ tv_chart_html = f"""
             background: rgba(19, 23, 34, 0.7);
             padding: 4px 8px;
             border-radius: 4px;
+            flex-wrap: wrap;
         }}
         .legend-item {{
             display: flex;
@@ -276,6 +412,12 @@ tv_chart_html = f"""
         }});
         candleSeries.setData({candle_json});
 
+        // Set Markers (BUY/SELL labels)
+        const markers = {markers_json};
+        if (markers && markers.length > 0) {{
+            candleSeries.setMarkers(markers);
+        }}
+
         // Volume Series
         const volumeSeries = chart.addHistogramSeries({{
             priceFormat: {{ type: 'volume' }},
@@ -290,10 +432,26 @@ tv_chart_html = f"""
         }});
         volumeSeries.setData({volume_json});
 
-        // Dynamic Indicators
-        const indicators = {indicators_json};
         const legend = document.getElementById('legend');
-        
+
+        // Range Filter Lines
+        const rfLines = {rf_json};
+        rfLines.forEach(item => {{
+            const rLine = chart.addLineSeries({{
+                color: item.color,
+                lineWidth: item.lineWidth,
+                priceLineVisible: false,
+            }});
+            rLine.setData(item.data);
+
+            const div = document.createElement('div');
+            div.className = 'legend-item';
+            div.innerHTML = `<span style="color:${{item.color}};">■</span> ${{item.name}}`;
+            legend.appendChild(div);
+        }});
+
+        // Dynamic Indicators (EMA / SMA)
+        const indicators = {indicators_json};
         indicators.forEach(ind => {{
             const lineSeries = chart.addLineSeries({{
                 color: ind.color,
@@ -310,7 +468,6 @@ tv_chart_html = f"""
 
         chart.timeScale().fitContent();
 
-        // Responsive Resizing
         window.addEventListener('resize', () => {{
             chart.applyOptions({{ width: chartElement.clientWidth }});
         }});
@@ -321,6 +478,16 @@ tv_chart_html = f"""
 
 components.html(tv_chart_html, height=580)
 
-# Stable auto-refresh interval (2 seconds)
+# --- Auto Trading Signal Alerts ---
+if st.session_state.auto_trade and st.session_state.rf_enabled and len(df) > 1:
+    last_candle = df.iloc[-1]
+    prev_candle = df.iloc[-2]
+    
+    if last_candle.get("rf_buy") or prev_candle.get("rf_buy"):
+        st.toast(f"🚀 RANGE FILTER BUY SIGNAL ON {symbol}!", icon="🟢")
+    elif last_candle.get("rf_sell") or prev_candle.get("rf_sell"):
+        st.toast(f"🔻 RANGE FILTER SELL SIGNAL ON {symbol}!", icon="🔴")
+
+# Refresh Interval
 time.sleep(2)
 st.rerun()
