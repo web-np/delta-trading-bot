@@ -33,6 +33,13 @@ if "indicators" not in st.session_state:
 # Delta Exchange API Logic
 DELTA_BASE_URL = "https://api.delta.exchange"
 
+# Correct Delta API Symbol Mapping
+SYMBOL_MAPPING = {
+    "BTCUSD": "BTCUSD",
+    "ETHUSD": "ETHUSD",
+    "SOLUSD": "SOLUSDT"
+}
+
 def get_delta_balance(api_key, api_secret):
     if not api_key or not api_secret:
         return 0.0
@@ -56,34 +63,50 @@ def get_delta_balance(api_key, api_secret):
         pass
     return 0.0
 
-def fetch_candles(symbol="BTCUSD", resolution="1m"):
+def fetch_candles(symbol_choice="BTCUSD", resolution="1m"):
+    target_symbol = SYMBOL_MAPPING.get(symbol_choice, symbol_choice)
     end_time = int(time.time())
-    start_time = end_time - (3600 * 5)  # 5 hours data for accurate Range Filter EMA
-    url = f"{DELTA_BASE_URL}/v2/chart/history?symbol={symbol}&resolution={resolution}&start={start_time}&end={end_time}"
+    start_time = end_time - (3600 * 5)  # 5 hours data
+    
+    url = f"{DELTA_BASE_URL}/v2/chart/history"
+    params = {
+        "symbol": target_symbol,
+        "resolution": resolution,
+        "start": start_time,
+        "end": end_time
+    }
+    
     try:
-        res = requests.get(url, timeout=3).json()
-        if res.get("success") and res.get("result"):
-            df = pd.DataFrame(res["result"])
-            df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-            df = df.sort_values("time").drop_duplicates(subset=["time"])
-            return df[["time", "open", "high", "low", "close", "volume"]]
+        res = requests.get(url, params=params, timeout=4)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("success") and data.get("result"):
+                df = pd.DataFrame(data["result"])
+                df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+                df = df.sort_values("time").drop_duplicates(subset=["time"])
+                if len(df) > 10:
+                    return df[["time", "open", "high", "low", "close", "volume"]]
     except Exception:
         pass
 
-    # Fallback simulation
+    # Symbol-specific realistic base fallback if API call fails or limits
+    default_bases = {"BTCUSD": 68000.0, "ETHUSD": 3500.0, "SOLUSD": 160.0}
+    base_val = default_bases.get(symbol_choice, 1000.0)
+    
     now = int(time.time()) - 60
     base_time = now - (150 * 60)
     times = [base_time + (i * 60) for i in range(150)]
     
-    np.random.seed(42)
-    noise = np.cumsum(np.random.randn(150) * 4.0)
-    base_price = 68000.0 + noise
+    np.random.seed(int(time.time()) % 1000)
+    noise = np.cumsum(np.random.randn(150) * (base_val * 0.0008))
+    base_price = base_val + noise
 
+    spread = base_val * 0.001
     opens = base_price
-    highs = base_price + np.random.uniform(5.0, 25.0, 150)
-    lows = base_price - np.random.uniform(5.0, 25.0, 150)
-    closes = base_price + np.random.uniform(-15.0, 15.0, 150)
-    vols = np.random.randint(100, 1800, 150)
+    highs = base_price + np.random.uniform(spread * 0.2, spread, 150)
+    lows = base_price - np.random.uniform(spread * 0.2, spread, 150)
+    closes = base_price + np.random.uniform(-spread * 0.5, spread * 0.5, 150)
+    vols = np.random.randint(50, 1200, 150)
 
     return pd.DataFrame({
         "time": times,
@@ -94,21 +117,19 @@ def fetch_candles(symbol="BTCUSD", resolution="1m"):
         "volume": vols
     })
 
-# --- PineScript to Python Conversion: Range Filter ---
+# --- Range Filter Indicator ---
 def calculate_range_filter(df, per=100, mult=3.0):
     src = df['close'].values
     n = len(src)
     if n < 2:
         return df
 
-    # Smooth Range: avrng = ta.ema(abs(x - x[1]), t), smoothrng = ta.ema(avrng, wper) * m
     diff = np.abs(np.diff(src, prepend=src[0]))
     diff_s = pd.Series(diff)
     wper = per * 2 - 1
     avrng = diff_s.ewm(span=per, adjust=False).mean()
     smrng = (avrng.ewm(span=wper, adjust=False).mean() * mult).values
 
-    # Range Filter calculation loop
     filt = np.zeros(n)
     filt[0] = src[0]
     for i in range(1, n):
@@ -120,7 +141,6 @@ def calculate_range_filter(df, per=100, mult=3.0):
         else:
             filt[i] = prev_f if (x + r > prev_f) else (x + r)
 
-    # Direction
     upward = np.zeros(n)
     downward = np.zeros(n)
     for i in range(1, n):
@@ -134,11 +154,9 @@ def calculate_range_filter(df, per=100, mult=3.0):
             upward[i] = upward[i - 1]
             downward[i] = downward[i - 1]
 
-    # Target Bands
     hband = filt + smrng
     lband = filt - smrng
 
-    # Breakouts & Signals
     long_cond = np.zeros(n, dtype=bool)
     short_cond = np.zeros(n, dtype=bool)
     for i in range(1, n):
@@ -183,7 +201,7 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Range Filter Indicator")
-st.session_state.rf_enabled = st.sidebar.checkbox("Enable Range Filter (Buy/Sell)", value=st.session_state.rf_enabled)
+st.session_state.rf_enabled = st.sidebar.checkbox("Enable Range Filter", value=st.session_state.rf_enabled)
 if st.session_state.rf_enabled:
     st.session_state.rf_period = st.sidebar.number_input("Sampling Period", min_value=1, max_value=300, value=st.session_state.rf_period)
     st.session_state.rf_mult = st.sidebar.number_input("Range Multiplier", min_value=0.1, max_value=10.0, value=st.session_state.rf_mult, step=0.1)
@@ -230,19 +248,20 @@ candle_data = []
 volume_data = []
 markers_data = []
 
+precision = 2 if symbol != "SOLUSD" else 3
+
 for _, row in df.iterrows():
     t_sec = int(row["time"])
-    o = round(float(row["open"]), 2)
-    h = round(float(row["high"]), 2)
-    l = round(float(row["low"]), 2)
-    c = round(float(row["close"]), 2)
+    o = round(float(row["open"]), precision)
+    h = round(float(row["high"]), precision)
+    l = round(float(row["low"]), precision)
+    c = round(float(row["close"]), precision)
     v = round(float(row["volume"]), 2)
 
     candle_data.append({"time": t_sec, "open": o, "high": h, "low": l, "close": c})
     vol_color = "rgba(38, 166, 154, 0.55)" if c >= o else "rgba(239, 83, 80, 0.55)"
     volume_data.append({"time": t_sec, "value": v, "color": vol_color})
 
-    # Range Filter Buy / Sell Markers
     if st.session_state.rf_enabled:
         if row.get('rf_buy'):
             markers_data.append({
@@ -261,7 +280,6 @@ for _, row in df.iterrows():
                 "text": "SELL"
             })
 
-# Additional Indicators calculation
 indicator_series = []
 for ind in st.session_state.indicators:
     t = ind["type"]
@@ -278,7 +296,7 @@ for ind in st.session_state.indicators:
     for _, row in df.iterrows():
         val = row[col_name]
         if pd.notna(val):
-            line_points.append({"time": int(row["time"]), "value": round(float(val), 2)})
+            line_points.append({"time": int(row["time"]), "value": round(float(val), precision)})
             
     if line_points:
         indicator_series.append({
@@ -287,26 +305,25 @@ for ind in st.session_state.indicators:
             "data": line_points
         })
 
-# Range Filter Line Series
 rf_series = []
 if st.session_state.rf_enabled and 'rf_filt' in df:
     rf_series.append({
         "name": "Range Filter",
         "color": "#90bff9",
         "lineWidth": 2,
-        "data": [{"time": int(r["time"]), "value": round(float(r["rf_filt"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_filt"])]
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_filt"]), precision)} for _, r in df.iterrows() if pd.notna(r["rf_filt"])]
     })
     rf_series.append({
         "name": "High Target",
         "color": "rgba(255, 255, 255, 0.5)",
         "lineWidth": 1,
-        "data": [{"time": int(r["time"]), "value": round(float(r["rf_hband"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_hband"])]
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_hband"]), precision)} for _, r in df.iterrows() if pd.notna(r["rf_hband"])]
     })
     rf_series.append({
         "name": "Low Target",
         "color": "rgba(41, 98, 255, 0.5)",
         "lineWidth": 1,
-        "data": [{"time": int(r["time"]), "value": round(float(r["rf_lband"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_lband"])]
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_lband"]), precision)} for _, r in df.iterrows() if pd.notna(r["rf_lband"])]
     })
 
 candle_json = json.dumps(candle_data)
@@ -315,7 +332,9 @@ markers_json = json.dumps(markers_data)
 indicators_json = json.dumps(indicator_series)
 rf_json = json.dumps(rf_series)
 
-# HTML/JS with Lightweight-Charts 4.1.1 + Markers
+# Unique ID so the chart always forces full re-render on symbol or data changes
+chart_div_id = f"chart_{symbol}_{int(time.time())}"
+
 tv_chart_html = f"""
 <!DOCTYPE html>
 <html>
@@ -337,7 +356,7 @@ tv_chart_html = f"""
             width: 100%;
             height: 560px;
         }}
-        #chart {{
+        #{chart_div_id} {{
             width: 100%;
             height: 100%;
         }}
@@ -351,7 +370,7 @@ tv_chart_html = f"""
             display: flex;
             gap: 12px;
             pointer-events: none;
-            background: rgba(19, 23, 34, 0.7);
+            background: rgba(19, 23, 34, 0.75);
             padding: 4px 8px;
             border-radius: 4px;
             flex-wrap: wrap;
@@ -366,13 +385,13 @@ tv_chart_html = f"""
 <body>
     <div id="chart-wrapper">
         <div class="legend" id="legend">
-            <span style="color: #2962FF;">{symbol}</span>
+            <span style="color: #2962FF; font-weight: bold;">{symbol}</span>
         </div>
-        <div id="chart"></div>
+        <div id="{chart_div_id}"></div>
     </div>
 
     <script>
-        const chartElement = document.getElementById('chart');
+        const chartElement = document.getElementById('{chart_div_id}');
         const chart = LightweightCharts.createChart(chartElement, {{
             width: chartElement.clientWidth || window.innerWidth,
             height: 560,
@@ -409,6 +428,11 @@ tv_chart_html = f"""
             borderVisible: false,
             wickUpColor: '#26a69a',
             wickDownColor: '#ef5350',
+            priceFormat: {{
+                type: 'price',
+                precision: {precision},
+                minMove: {0.01 if precision == 2 else 0.001}
+            }}
         }});
         candleSeries.setData({candle_json});
 
@@ -450,7 +474,7 @@ tv_chart_html = f"""
             legend.appendChild(div);
         }});
 
-        // Dynamic Indicators (EMA / SMA)
+        // Dynamic Indicators
         const indicators = {indicators_json};
         indicators.forEach(ind => {{
             const lineSeries = chart.addLineSeries({{
@@ -476,7 +500,8 @@ tv_chart_html = f"""
 </html>
 """
 
-components.html(tv_chart_html, height=580)
+# Dynamic key forces Streamlit to rebuild iframe immediately on Symbol Change
+components.html(tv_chart_html, height=580, key=f"tv_chart_{symbol}")
 
 # --- Auto Trading Signal Alerts ---
 if st.session_state.auto_trade and st.session_state.rf_enabled and len(df) > 1:
