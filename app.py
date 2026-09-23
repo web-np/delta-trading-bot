@@ -27,7 +27,12 @@ if "indicators" not in st.session_state:
     ]
 
 DELTA_BASE_URL = "https://api.delta.exchange"
-SYMBOL_MAP = {"BTCUSD": "BTCUSD", "ETHUSD": "ETHUSD", "SOLUSD": "SOLUSDT"}
+# Delta Exchange actual contract symbols
+SYMBOL_MAP = {
+    "BTCUSD": "BTCUSD",
+    "ETHUSD": "ETHUSD",
+    "SOLUSD": "SOLUSD"
+}
 
 def get_delta_balance(api_key, api_secret):
     if not api_key or not api_secret:
@@ -52,54 +57,68 @@ def get_delta_balance(api_key, api_secret):
         pass
     return 0.0
 
-def get_live_price(symbol):
-    """Real live market mark/spot price from Delta public ticker"""
+def fetch_candles_real(symbol):
+    """Fetch 100% actual live candles from Delta Public API"""
+    target = SYMBOL_MAP.get(symbol, symbol)
+    end_time = int(time.time())
+    start_time = end_time - (3600 * 5)  # 5 ghante ka data
+    
+    url = f"{DELTA_BASE_URL}/v2/chart/history"
+    params = {
+        "symbol": target,
+        "resolution": "1m",
+        "start": start_time,
+        "end": end_time
+    }
+    
+    try:
+        res = requests.get(url, params=params, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("success") and data.get("result"):
+                df = pd.DataFrame(data["result"])
+                df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+                df = df.sort_values("time").drop_duplicates(subset=["time"])
+                df["time"] = df["time"].astype(int)
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = df[col].astype(float)
+                if len(df) > 5:
+                    return df[["time", "open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
+
+    # Alternative endpoint agar pehla endpoint busy ho
+    try:
+        alt_url = f"https://cdn.delta.exchange/v2/history/candles?resolution=1m&symbol={target}"
+        r = requests.get(alt_url, timeout=4).json()
+        if r.get("result"):
+            df = pd.DataFrame(r["result"], columns=["time", "open", "high", "low", "close", "volume"])
+            df = df.sort_values("time")
+            return df
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+def get_live_ticker_price(symbol):
+    """Real live market mark price Delta ticker se"""
     target = SYMBOL_MAP.get(symbol, symbol)
     url = f"{DELTA_BASE_URL}/v2/tickers/{target}"
     try:
-        res = requests.get(url, timeout=2).json()
+        res = requests.get(url, timeout=3).json()
         if res.get("success"):
             return float(res["result"]["mark_price"])
     except Exception:
         pass
     return None
 
-def fetch_candles_once(symbol):
-    """Initial candle history fetch from Delta"""
-    target = SYMBOL_MAP.get(symbol, symbol)
-    end_time = int(time.time())
-    start_time = end_time - (3600 * 3)  # Last 3 hours
-    url = f"{DELTA_BASE_URL}/v2/chart/history?symbol={target}&resolution=1m&start={start_time}&end={end_time}"
-    try:
-        res = requests.get(url, timeout=4).json()
-        if res.get("success") and res.get("result"):
-            df = pd.DataFrame(res["result"])
-            df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-            df = df.sort_values("time").drop_duplicates(subset=["time"])
-            return df[["time", "open", "high", "low", "close", "volume"]]
-    except Exception:
-        pass
-    
-    # Stable deterministic fallback if API unavailable (fixed seed, no random shifts)
-    now = (int(time.time()) // 60) * 60
-    times = [now - (i * 60) for i in reversed(range(80))]
-    base = 3500.0 if "ETH" in symbol else (68000.0 if "BTC" in symbol else 160.0)
-    opens = [base + (i * 0.2) for i in range(80)]
-    return pd.DataFrame({
-        "time": times,
-        "open": opens,
-        "high": [x + 2.0 for x in opens],
-        "low": [x - 2.0 for x in opens],
-        "close": opens,
-        "volume": [500] * 80
-    })
-
-# --- Range Filter Calculation ---
+# --- Range Filter Formula ---
 def calculate_range_filter(df, per=50, mult=2.5):
+    if len(df) < 2:
+        return df
+
     src = df['close'].values
     n = len(src)
-    if n < 2:
-        return df
 
     diff = np.abs(np.diff(src, prepend=src[0]))
     diff_s = pd.Series(diff)
@@ -200,34 +219,39 @@ for idx, ind in enumerate(st.session_state.indicators):
         st.session_state.indicators.pop(idx)
         st.rerun()
 
-# --- Candle Cache & Live Candle Building ---
-if st.session_state.last_symbol != symbol or symbol not in st.session_state.candle_cache:
-    st.session_state.candle_cache[symbol] = fetch_candles_once(symbol)
+# Symbol badalne par cache reset karo
+if st.session_state.last_symbol != symbol:
+    st.session_state.candle_cache[symbol] = fetch_candles_real(symbol)
     st.session_state.last_symbol = symbol
 
-df = st.session_state.candle_cache[symbol].copy()
+df = st.session_state.candle_cache.get(symbol, pd.DataFrame())
 
-# Live Price Fetch & Tick Update
-current_price = get_live_price(symbol)
+# Agar cache khali ho toh dobara fetch karein
+if df.empty:
+    df = fetch_candles_real(symbol)
+    st.session_state.candle_cache[symbol] = df
+
+# Live Price Fetch karke last candle ko update karna
+current_price = get_live_ticker_price(symbol)
 current_time_min = (int(time.time()) // 60) * 60
 
-if current_price is not None and len(df) > 0:
+if not df.empty and current_price is not None:
     last_idx = df.index[-1]
-    last_time = int(df.loc[last_idx, "time"])
+    last_candle_time = int(df.loc[last_idx, "time"])
 
-    if current_time_min > last_time:
-        # 1-minute close hui: nayi candle shuru karo
+    if current_time_min > last_candle_time:
+        # Nayi candle minute shuru hone par
         new_row = pd.DataFrame([{
             "time": current_time_min,
             "open": current_price,
             "high": current_price,
             "low": current_price,
             "close": current_price,
-            "volume": 10.0
+            "volume": 1.0
         }])
         df = pd.concat([df, new_row], ignore_index=True)
     else:
-        # Current minute ki live candle update karo
+        # Chalu candle ka close/high/low update
         df.loc[last_idx, "close"] = current_price
         if current_price > df.loc[last_idx, "high"]:
             df.loc[last_idx, "high"] = current_price
@@ -237,16 +261,21 @@ if current_price is not None and len(df) > 0:
 
     st.session_state.candle_cache[symbol] = df
 
-# Top Status Metrics
+# Header Metrics
 bal = get_delta_balance(api_key, api_secret)
 c1, c2, c3, c4 = st.columns(4)
-live_disp = f"${current_price:,.2f}" if current_price else f"${df['close'].iloc[-1]:,.2f}"
+live_disp = f"${current_price:,.2f}" if current_price else (f"${df['close'].iloc[-1]:,.2f}" if not df.empty else "$0.00")
 c1.metric("Wallet Balance", f"${bal:,.2f} USDT")
 c2.metric("Pair (Live Price)", f"{symbol} : {live_disp}")
 c3.metric("Auto Trade", "ON" if st.session_state.auto_trade else "OFF")
 c4.metric("Last Candle Tick", datetime.now().strftime("%H:%M:%S"))
 
-# Indicator Processing
+if df.empty:
+    st.error("Delta Exchange candle data load nahi ho pa raha hai. Thodi der me auto-retry ho raha hai...")
+    time.sleep(2)
+    st.rerun()
+
+# Indicators calculation
 if st.session_state.rf_enabled:
     df = calculate_range_filter(df, per=50, mult=2.5)
 
@@ -266,7 +295,6 @@ for _, row in df.iterrows():
     vol_color = "rgba(38, 166, 154, 0.55)" if c >= o else "rgba(239, 83, 80, 0.55)"
     volume_data.append({"time": t_sec, "value": v, "color": vol_color})
 
-    # Markers (Buy/Sell sirf 1-candle confirmed point par dikhega)
     if st.session_state.rf_enabled:
         if row.get('rf_buy'):
             markers_data.append({
@@ -473,8 +501,6 @@ tv_chart_html = f"""
             legend.appendChild(item);
         }});
 
-        chart.timeScale().scrollToPosition(5, false);
-
         window.addEventListener('resize', () => {{
             chart.applyOptions({{ width: chartElement.clientWidth }});
         }});
@@ -485,14 +511,14 @@ tv_chart_html = f"""
 
 components.html(tv_chart_html, height=580)
 
-# Trade Toast Signal
+# Trade Notification Toast
 if st.session_state.auto_trade and st.session_state.rf_enabled and len(df) > 1:
     last_c = df.iloc[-1]
     if last_c.get("rf_buy"):
-        st.toast(f"🟢 RANGE FILTER BUY SIGNAL ON {symbol} @ {live_disp}")
+        st.toast(f"🟢 BUY SIGNAL ON {symbol} @ {live_disp}")
     elif last_c.get("rf_sell"):
-        st.toast(f"🔴 RANGE FILTER SELL SIGNAL ON {symbol} @ {live_disp}")
+        st.toast(f"🔴 SELL SIGNAL ON {symbol} @ {live_disp}")
 
-# Real-time refresh loop (1 second update)
-time.sleep(1)
+# Refresh Loop (2 seconds interval)
+time.sleep(2)
 st.rerun()
