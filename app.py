@@ -500,8 +500,8 @@ tv_chart_html = f"""
 </html>
 """
 
-# Dynamic key forces Streamlit to rebuild iframe immediately on Symbol Change
-components.html(tv_chart_html, height=580, key=f"tv_chart_{symbol}")
+# Dynamic HTML render without invalid 'key' argument
+components.html(tv_chart_html, height=580)
 
 # --- Auto Trading Signal Alerts ---
 if st.session_state.auto_trade and st.session_state.rf_enabled and len(df) > 1:
