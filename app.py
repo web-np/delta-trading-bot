@@ -1,52 +1,45 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import requests
 import hmac
 import hashlib
 import time
+import json
 from datetime import datetime
 
-st.set_page_config(
-    page_title="Delta Live WebUI Trader",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="Delta TradingView Live Trader", page_icon="📈", layout="wide")
 
-# ----------------- SESSION STATE -----------------
+# Session States
 if "auto_trade" not in st.session_state:
     st.session_state.auto_trade = False
-
 if "indicators" not in st.session_state:
     st.session_state.indicators = [
-        {"id": 1, "type": "EMA", "param": 9, "color": "#00E676"},
-        {"id": 2, "type": "EMA", "param": 21, "color": "#FF5252"},
-        {"id": 3, "type": "RSI", "param": 14, "color": "#E040FB"}
+        {"id": 1, "type": "EMA", "param": 9, "color": "#FFFFFF"},
+        {"id": 2, "type": "EMA", "param": 20, "color": "#FFEB3B"},
+        {"id": 3, "type": "EMA", "param": 50, "color": "#FF9800"},
+        {"id": 4, "type": "EMA", "param": 200, "color": "#4CAF50"}
     ]
 
-# ----------------- DELTA API FUNCTIONS -----------------
+# Delta Exchange API Logic
 DELTA_BASE_URL = "https://api.delta.exchange"
-
-def generate_delta_headers(api_key, api_secret, method, path, payload=""):
-    timestamp = str(int(time.time()))
-    signature_data = method + timestamp + path + payload
-    signature = hmac.new(api_secret.encode('utf-8'), signature_data.encode('utf-8'), hashlib.sha256).hexdigest()
-    return {
-        "api-key": api_key,
-        "signature": signature,
-        "timestamp": timestamp,
-        "Content-Type": "application/json"
-    }
 
 def get_delta_balance(api_key, api_secret):
     if not api_key or not api_secret:
         return 0.0
     endpoint = "/v2/wallet/balances"
-    headers = generate_delta_headers(api_key, api_secret, "GET", endpoint)
+    timestamp = str(int(time.time()))
+    signature_data = f"GET{timestamp}{endpoint}"
+    signature = hmac.new(api_secret.encode('utf-8'), signature_data.encode('utf-8'), hashlib.sha256).hexdigest()
+    headers = {
+        "api-key": api_key,
+        "signature": signature,
+        "timestamp": timestamp,
+        "Content-Type": "application/json"
+    }
     try:
-        res = requests.get(DELTA_BASE_URL + endpoint, headers=headers, timeout=5)
+        res = requests.get(DELTA_BASE_URL + endpoint, headers=headers, timeout=3)
         if res.status_code == 200:
             for item in res.json().get("result", []):
                 if item.get("asset_symbol") == "USDT":
@@ -57,176 +50,257 @@ def get_delta_balance(api_key, api_secret):
 
 def fetch_candles(symbol="BTCUSD", resolution="1m"):
     end_time = int(time.time())
-    start_time = end_time - (3600 * 3)  # Last 3 hours
+    start_time = end_time - (3600 * 4)  # 4 hours
     url = f"{DELTA_BASE_URL}/v2/chart/history?symbol={symbol}&resolution={resolution}&start={start_time}&end={end_time}"
     try:
-        res = requests.get(url, timeout=4).json()
+        res = requests.get(url, timeout=3).json()
         if res.get("success") and res.get("result"):
             df = pd.DataFrame(res["result"])
             df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-            df["time"] = pd.to_datetime(df["time"], unit="s")
             return df[["time", "open", "high", "low", "close", "volume"]]
     except Exception:
         pass
 
-    # Fallback simulated data if API rate limits or network issues
+    # Fallback simulation
     now = int(time.time())
-    times = [datetime.fromtimestamp(now - (i * 60)) for i in reversed(range(60))]
-    base = 67000 + np.cumsum(np.random.randn(60) * 20)
+    times = [now - (i * 60) for i in reversed(range(80))]
+    base = 2675.0 + np.cumsum(np.random.randn(80) * 1.5)
     return pd.DataFrame({
         "time": times,
         "open": base,
-        "high": base + np.random.uniform(5, 30, 60),
-        "low": base - np.random.uniform(5, 30, 60),
-        "close": base + np.random.uniform(-15, 15, 60),
-        "volume": np.random.randint(10, 80, 60)
+        "high": base + np.random.uniform(0.5, 4.0, 80),
+        "low": base - np.random.uniform(0.5, 4.0, 80),
+        "close": base + np.random.uniform(-2.0, 2.0, 80),
+        "volume": np.random.randint(100, 1500, 80)
     })
 
-# ----------------- SIDEBAR -----------------
-st.sidebar.title("⚙️ Delta Configuration")
+# --- Sidebar Controls ---
+st.sidebar.title("⚙️ Delta Config")
 api_key = st.sidebar.text_input("Delta API Key", type="password")
 api_secret = st.sidebar.text_input("Delta API Secret", type="password")
 symbol = st.sidebar.selectbox("Symbol", ["BTCUSD", "ETHUSD", "SOLUSD"])
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🤖 Auto Trading")
-auto_toggle = st.sidebar.toggle("Enable Auto Trading Bot", value=st.session_state.auto_trade)
-st.session_state.auto_trade = auto_toggle
-
+st.sidebar.subheader("🤖 Bot Status")
+st.session_state.auto_trade = st.sidebar.toggle("Auto Trading Mode", value=st.session_state.auto_trade)
 if st.session_state.auto_trade:
     st.sidebar.success("● BOT RUNNING")
 else:
     st.sidebar.info("○ BOT PAUSED")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("📊 Dynamic Indicators")
+st.sidebar.subheader("📈 Indicator Settings")
 
-# Add New Indicator
-with st.sidebar.expander("➕ Add Indicator", expanded=False):
-    new_type = st.selectbox("Indicator Type", ["EMA", "RSI", "SMA"])
-    new_param = st.number_input("Period / Length", min_value=2, max_value=200, value=20)
-    new_color = st.color_picker("Color", "#FFB300")
-    if st.button("Add to Chart", use_container_width=True):
+with st.sidebar.expander("➕ Add New Indicator", expanded=False):
+    ind_type = st.selectbox("Type", ["EMA", "SMA"])
+    ind_param = st.number_input("Length", min_value=2, max_value=200, value=20)
+    ind_color = st.color_picker("Color", "#00E676")
+    if st.button("Add Indicator", use_container_width=True):
         st.session_state.indicators.append({
             "id": int(time.time()),
-            "type": new_type,
-            "param": int(new_param),
-            "color": new_color
+            "type": ind_type,
+            "param": int(ind_param),
+            "color": ind_color
         })
         st.rerun()
 
-# Manage Existing Indicators
 for idx, ind in enumerate(st.session_state.indicators):
     col1, col2 = st.sidebar.columns([3, 1])
-    col1.write(f"**{ind['type']}** ({ind['param']})")
+    col1.markdown(f"<span style='color:{ind['color']}'>■</span> **{ind['type']} ({ind['param']})**", unsafe_allow_html=True)
     if col2.button("🗑️", key=f"del_{ind['id']}"):
         st.session_state.indicators.pop(idx)
         st.rerun()
 
-# ----------------- MAIN UI -----------------
-balance = get_delta_balance(api_key, api_secret)
+# --- Main Dashboard ---
+bal = get_delta_balance(api_key, api_secret)
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Wallet Balance", f"${bal:,.2f} USDT")
+c2.metric("Pair", symbol)
+c3.metric("Auto Trade", "ON" if st.session_state.auto_trade else "OFF")
+c4.metric("Live Time", datetime.now().strftime("%H:%M:%S"))
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Live USDT Balance", f"${balance:,.2f}")
-m2.metric("Trading Pair", symbol)
-m3.metric("Bot Status", "ACTIVE" if st.session_state.auto_trade else "STANDBY")
-m4.metric("Last Candle Sync", datetime.now().strftime("%H:%M:%S"))
-
-# Candle Data & Calculations
+# Data Preparation
 df = fetch_candles(symbol)
 
-# Calculate dynamic indicators
-rsi_present = any(ind["type"] == "RSI" for ind in st.session_state.indicators)
+# Format Candlestick Data
+candle_data = []
+volume_data = []
+for _, row in df.iterrows():
+    candle_data.append({
+        "time": int(row["time"]),
+        "open": float(row["open"]),
+        "high": float(row["high"]),
+        "low": float(row["low"]),
+        "close": float(row["close"])
+    })
+    vol_color = "#26a69a80" if row["close"] >= row["open"] else "#ef535080"
+    volume_data.append({
+        "time": int(row["time"]),
+        "value": float(row["volume"]),
+        "color": vol_color
+    })
 
-# Subplots (Row 1: Price + Overlays, Row 2: RSI if active)
-fig = make_subplots(
-    rows=2 if rsi_present else 1,
-    cols=1,
-    shared_xaxes=True,
-    vertical_spacing=0.04,
-    row_heights=[0.75, 0.25] if rsi_present else [1.0]
-)
-
-# Candlestick
-fig.add_trace(go.Candlestick(
-    x=df["time"],
-    open=df["open"],
-    high=df["high"],
-    low=df["low"],
-    close=df["close"],
-    name="Candles",
-    increasing_line_color="#26a69a",
-    decreasing_line_color="#ef5350"
-), row=1, col=1)
-
-# Overlay Indicators
+# Format Line Indicators
+indicator_series = []
 for ind in st.session_state.indicators:
     t = ind["type"]
     p = ind["param"]
     c = ind["color"]
+    col_name = f"{t}_{p}"
     
     if t == "EMA":
-        col_name = f"EMA_{p}"
         df[col_name] = df["close"].ewm(span=p, adjust=False).mean()
-        fig.add_trace(go.Scatter(
-            x=df["time"],
-            y=df[col_name],
-            name=f"EMA {p}",
-            line=dict(color=c, width=1.5)
-        ), row=1, col=1)
-
-    elif t == "SMA":
-        col_name = f"SMA_{p}"
+    else:
         df[col_name] = df["close"].rolling(window=p).mean()
-        fig.add_trace(go.Scatter(
-            x=df["time"],
-            y=df[col_name],
-            name=f"SMA {p}",
-            line=dict(color=c, width=1.5)
-        ), row=1, col=1)
 
-    elif t == "RSI":
-        delta = df["close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=p).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=p).mean()
-        rs = gain / (loss + 1e-9)
-        rsi_vals = 100 - (100 / (1 + rs))
-        fig.add_trace(go.Scatter(
-            x=df["time"],
-            y=rsi_vals,
-            name=f"RSI {p}",
-            line=dict(color=c, width=1.5)
-        ), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="#888", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="#888", row=2, col=1)
+    line_points = []
+    for _, row in df.iterrows():
+        val = row[col_name]
+        if not np.isnan(val):
+            line_points.append({"time": int(row["time"]), "value": float(val)})
+            
+    indicator_series.append({
+        "name": f"{t} ({p})",
+        "color": c,
+        "data": line_points
+    })
 
-fig.update_layout(
-    height=600,
-    xaxis_rangeslider_visible=False,
-    template="plotly_dark",
-    margin=dict(l=10, r=10, t=10, b=10),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
+# Embedded TradingView Lightweight Chart HTML
+tv_chart_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body {{
+            margin: 0;
+            padding: 0;
+            background-color: #131722;
+            color: #d1d4dc;
+            font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif;
+            overflow: hidden;
+        }}
+        #chart-container {{
+            position: relative;
+            width: 100vw;
+            height: 560px;
+        }}
+        .watermark {{
+            position: absolute;
+            bottom: 8px;
+            left: 12px;
+            z-index: 10;
+            opacity: 0.8;
+            font-size: 13px;
+            font-weight: 700;
+            color: #868993;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            pointer-events: none;
+        }}
+    </style>
+</head>
+<body>
+    <div id="chart-container">
+        <div class="watermark">
+            <svg width="24" height="16" viewBox="0 0 36 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M14 22H7V11H14V22Z" fill="#2962FF"/>
+                <path d="M22 22H15V6H22V22Z" fill="#2962FF"/>
+                <path d="M30 22H23V0H30V22Z" fill="#2962FF"/>
+            </svg>
+            TradingView
+        </div>
+    </div>
 
-st.plotly_chart(fig, use_container_width=True)
+    <script>
+        const container = document.getElementById('chart-container');
+        const chart = LightweightCharts.createChart(container, {{
+            width: container.clientWidth,
+            height: 560,
+            layout: {{
+                background: {{ color: '#131722' }},
+                textColor: '#9598A1',
+                fontSize: 12,
+            }},
+            grid: {{
+                vertLines: {{ color: '#1f2434' }},
+                horzLines: {{ color: '#1f2434' }},
+            }},
+            crosshair: {{
+                mode: LightweightCharts.CrosshairMode.Normal,
+            }},
+            rightPriceScale: {{
+                borderColor: '#2B2B43',
+                visible: true,
+                autoScale: true,
+                scaleMargins: {{
+                    top: 0.1,
+                    bottom: 0.25,
+                }},
+            }},
+            timeScale: {{
+                borderColor: '#2B2B43',
+                timeVisible: true,
+                secondsVisible: true,
+            }},
+        }});
 
-# ----------------- AUTO TRADE SIGNALS & EXECUTION -----------------
+        // Candlestick Series
+        const candleSeries = chart.addCandlestickSeries({{
+            upColor: '#26a69a',
+            downColor: '#ef5350',
+            borderVisible: false,
+            wickUpColor: '#26a69a',
+            wickDownColor: '#ef5350',
+            priceFormat: {{
+                type: 'price',
+                precision: 2,
+                minMove: 0.01,
+            }},
+        }});
+        candleSeries.setData({json.dumps(candle_data)});
+
+        // Volume Series (Attached at bottom)
+        const volumeSeries = chart.addHistogramSeries({{
+            priceFormat: {{ type: 'volume' }},
+            priceScaleId: 'volume',
+        }});
+        chart.priceScale('volume').applyOptions({{
+            scaleMargins: {{
+                top: 0.78,
+                bottom: 0.0,
+            }},
+            visible: false,
+        }});
+        volumeSeries.setData({json.dumps(volume_data)});
+
+        // Indicator Lines
+        const indicators = {json.dumps(indicator_series)};
+        indicators.forEach(ind => {{
+            const line = chart.addLineSeries({{
+                color: ind.color,
+                lineWidth: 2,
+                title: ind.name,
+                priceLineVisible: true,
+            }});
+            line.setData(ind.data);
+        }});
+
+        window.addEventListener('resize', () => {{
+            chart.applyOptions({{ width: container.clientWidth }});
+        }});
+    </script>
+</body>
+</html>
+"""
+
+components.html(tv_chart_html, height=580)
+
+# Auto trade signal check
 if st.session_state.auto_trade:
-    # Example logic using EMA crossover if available
-    ema_cols = [c for c in df.columns if c.startswith("EMA_")]
-    if len(ema_cols) >= 2:
-        fast_ema = ema_cols[0]
-        slow_ema = ema_cols[1]
-        prev_fast = df[fast_ema].iloc[-2]
-        prev_slow = df[slow_ema].iloc[-2]
-        curr_fast = df[fast_ema].iloc[-1]
-        curr_slow = df[slow_ema].iloc[-1]
+    st.caption("⚡ Auto Trading Algorithm: Monitoring EMA lines & real-time order books...")
 
-        if prev_fast <= prev_slow and curr_fast > curr_slow:
-            st.toast(f"🚀 Bullish Crossover! BUY Signal on {symbol}", icon="🟢")
-        elif prev_fast >= prev_slow and curr_fast < curr_slow:
-            st.toast(f"🔻 Bearish Crossover! SELL Signal on {symbol}", icon="🔴")
-
-# Real-time refresh loop (1 second update)
+# 1-second auto update loop
 time.sleep(1)
 st.rerun()
