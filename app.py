@@ -52,14 +52,14 @@ def get_delta_balance(api_key, api_secret):
             continue
     return 0.0
 
-def fetch_candles_safe(symbol):
-    """Guaranteed non-empty DataFrame with proper 'close' column"""
+def fetch_candles_safe(symbol, timeframe="5m"):
+    """Guaranteed non-empty DataFrame with custom timeframe support"""
     binance_map = {"ETHUSD": "ETHUSDT", "BTCUSD": "BTCUSDT", "SOLUSD": "SOLUSDT"}
     bin_symbol = binance_map.get(symbol, "ETHUSDT")
 
-    # Try Binance API (Global & 100% reliable)
+    # Try Binance API
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={bin_symbol}&interval=1m&limit=150"
+        url = f"https://api.binance.com/api/v3/klines?symbol={bin_symbol}&interval={timeframe}&limit=160"
         res = requests.get(url, headers=HEADERS, timeout=4)
         if res.status_code == 200:
             raw = res.json()
@@ -77,10 +77,10 @@ def fetch_candles_safe(symbol):
 
     # Try Delta Public API
     end_time = int(time.time())
-    start_time = end_time - (3600 * 3)
+    start_time = end_time - (3600 * 12)
     for delta_url in ["https://api.delta.exchange/v2/chart/history", "https://api.india.delta.exchange/v2/chart/history"]:
         try:
-            params = {"symbol": symbol, "resolution": "1m", "start": start_time, "end": end_time}
+            params = {"symbol": symbol, "resolution": timeframe, "start": start_time, "end": end_time}
             res = requests.get(delta_url, params=params, headers=HEADERS, timeout=3)
             if res.status_code == 200:
                 data = res.json()
@@ -95,9 +95,10 @@ def fetch_candles_safe(symbol):
         except Exception:
             pass
 
-    # Safe hard-coded fallback if both APIs fail (prevents KeyError 'close')
-    now = (int(time.time()) // 60) * 60
-    times = [now - (i * 60) for i in reversed(range(80))]
+    # Safe deterministic fallback
+    tf_seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "1h": 3600, "1d": 86400}.get(timeframe, 300)
+    now = (int(time.time()) // tf_seconds) * tf_seconds
+    times = [now - (i * tf_seconds) for i in reversed(range(80))]
     base = 3500.0 if "ETH" in symbol else (68000.0 if "BTC" in symbol else 160.0)
     return pd.DataFrame({
         "time": times,
@@ -181,7 +182,11 @@ def calculate_range_filter(df, per=50, mult=2.5):
 st.sidebar.title("⚙️ Delta Config")
 api_key = st.sidebar.text_input("Delta API Key", type="password")
 api_secret = st.sidebar.text_input("Delta API Secret", type="password")
-symbol = st.sidebar.selectbox("Symbol", ["ETHUSD", "BTCUSD", "SOLUSD"])
+
+col_sym, col_tf = st.sidebar.columns(2)
+symbol = col_sym.selectbox("Symbol", ["ETHUSD", "BTCUSD", "SOLUSD"])
+# 5m default selected
+timeframe = col_tf.selectbox("Candle Timeframe", ["1m", "3m", "5m", "15m", "1h", "1d"], index=2)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 Bot Status")
@@ -218,10 +223,10 @@ for idx, ind in enumerate(st.session_state.indicators):
 # --- Main Dashboard ---
 bal = get_delta_balance(api_key, api_secret)
 
-# Fetch guaranteed DataFrame
-df = fetch_candles_safe(symbol)
+# Fetch DataFrame with user-selected timeframe
+df = fetch_candles_safe(symbol, timeframe)
 
-# Calculate Indicators only when 'close' column exists
+# Calculate Indicators
 if "close" in df.columns:
     if st.session_state.rf_enabled:
         df = calculate_range_filter(df, per=50, mult=2.5)
@@ -240,7 +245,7 @@ last_price = float(df["close"].iloc[-1]) if not df.empty and "close" in df.colum
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Delta Wallet Balance", f"${bal:,.2f} USDT")
-c2.metric("Pair (Live Price)", f"{symbol} : ${last_price:,.2f}")
+c2.metric("Pair (Live Price)", f"{symbol} ({timeframe}) : ${last_price:,.2f}")
 c3.metric("Auto Trade", "ON" if st.session_state.auto_trade else "OFF")
 c4.metric("Last Sync", datetime.now().strftime("%H:%M:%S"))
 
@@ -327,10 +332,11 @@ markers_json = json.dumps(markers_data)
 indicators_json = json.dumps(indicator_series)
 rf_json = json.dumps(rf_series)
 
-# Target WebSocket stream symbol (ETHUSDT / BTCUSDT / SOLUSDT)
+# Dynamic WebSocket Stream for Timeframe & Pair
 ws_symbol = {"ETHUSD": "ethusdt", "BTCUSD": "btcusdt", "SOLUSD": "solusdt"}.get(symbol, "ethusdt")
+ws_stream_name = f"{ws_symbol}@kline_{timeframe}"
 
-# HTML with Built-in WebSocket for Real-time 1-Second Candle Updating
+# Chart HTML with Real-time WebSocket matched to chosen Timeframe
 tv_chart_html = f"""
 <!DOCTYPE html>
 <html>
@@ -376,7 +382,7 @@ tv_chart_html = f"""
 <body>
     <div id="chart-wrapper">
         <div class="legend" id="legend">
-            <span id="title_price" style="color: #2962FF; font-weight: bold;">{symbol} : ${last_price:,.2f}</span>
+            <span id="title_price" style="color: #2962FF; font-weight: bold;">{symbol} ({timeframe}) : ${last_price:,.2f}</span>
         </div>
         <div id="chart"></div>
     </div>
@@ -467,8 +473,8 @@ tv_chart_html = f"""
             legend.appendChild(item);
         }});
 
-        // Live WebSocket for true 1-Second tick-by-tick candle updates
-        const socket = new WebSocket('wss://stream.binance.com:9443/ws/{ws_symbol}@kline_1m');
+        // Live WebSocket matching selected timeframe
+        const socket = new WebSocket('wss://stream.binance.com:9443/ws/{ws_stream_name}');
         socket.onmessage = (event) => {{
             const msg = JSON.parse(event.data);
             if (msg.k) {{
@@ -489,7 +495,7 @@ tv_chart_html = f"""
                     color: volColor
                 }});
 
-                document.getElementById('title_price').innerText = '{symbol} : $' + candle.close.toFixed(2);
+                document.getElementById('title_price').innerText = '{symbol} ({timeframe}) : $' + candle.close.toFixed(2);
             }}
         }};
 
@@ -507,6 +513,6 @@ components.html(tv_chart_html, height=590)
 if st.session_state.auto_trade and st.session_state.rf_enabled and len(df) > 1:
     last_c = df.iloc[-1]
     if last_c.get("rf_buy"):
-        st.toast(f"🟢 BUY SIGNAL ON {symbol} @ ${last_price:,.2f}")
+        st.toast(f"🟢 BUY SIGNAL ON {symbol} ({timeframe}) @ ${last_price:,.2f}")
     elif last_c.get("rf_sell"):
-        st.toast(f"🔴 SELL SIGNAL ON {symbol} @ ${last_price:,.2f}")
+        st.toast(f"🔴 SELL SIGNAL ON {symbol} ({timeframe}) @ ${last_price:,.2f}")
