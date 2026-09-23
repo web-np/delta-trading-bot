@@ -9,11 +9,12 @@ import time
 import json
 from datetime import datetime
 
-st.set_page_config(page_title="Delta TradingView Live Trader", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Delta Live WebUI Trader", page_icon="📈", layout="wide")
 
-# Session States
+# Session State Setup
 if "auto_trade" not in st.session_state:
     st.session_state.auto_trade = False
+
 if "indicators" not in st.session_state:
     st.session_state.indicators = [
         {"id": 1, "type": "EMA", "param": 9, "color": "#FFFFFF"},
@@ -50,28 +51,40 @@ def get_delta_balance(api_key, api_secret):
 
 def fetch_candles(symbol="BTCUSD", resolution="1m"):
     end_time = int(time.time())
-    start_time = end_time - (3600 * 4)  # 4 hours
+    start_time = end_time - (3600 * 3)  # Last 3 hours
     url = f"{DELTA_BASE_URL}/v2/chart/history?symbol={symbol}&resolution={resolution}&start={start_time}&end={end_time}"
     try:
         res = requests.get(url, timeout=3).json()
         if res.get("success") and res.get("result"):
             df = pd.DataFrame(res["result"])
             df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+            df = df.sort_values("time").drop_duplicates(subset=["time"])
             return df[["time", "open", "high", "low", "close", "volume"]]
     except Exception:
         pass
 
-    # Fallback simulation
-    now = int(time.time())
-    times = [now - (i * 60) for i in reversed(range(80))]
-    base = 2675.0 + np.cumsum(np.random.randn(80) * 1.5)
+    # Simulation fallback with strictly ordered Unix timestamps (seconds)
+    now = int(time.time()) - 60
+    base_time = now - (100 * 60)
+    times = [base_time + (i * 60) for i in range(100)]
+    
+    np.random.seed(42)
+    noise = np.cumsum(np.random.randn(100) * 2.0)
+    base_price = 2675.0 + noise
+
+    opens = base_price
+    highs = base_price + np.random.uniform(0.5, 4.0, 100)
+    lows = base_price - np.random.uniform(0.5, 4.0, 100)
+    closes = base_price + np.random.uniform(-2.0, 2.0, 100)
+    vols = np.random.randint(100, 1800, 100)
+
     return pd.DataFrame({
         "time": times,
-        "open": base,
-        "high": base + np.random.uniform(0.5, 4.0, 80),
-        "low": base - np.random.uniform(0.5, 4.0, 80),
-        "close": base + np.random.uniform(-2.0, 2.0, 80),
-        "volume": np.random.randint(100, 1500, 80)
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": vols
     })
 
 # --- Sidebar Controls ---
@@ -117,30 +130,27 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Wallet Balance", f"${bal:,.2f} USDT")
 c2.metric("Pair", symbol)
 c3.metric("Auto Trade", "ON" if st.session_state.auto_trade else "OFF")
-c4.metric("Live Time", datetime.now().strftime("%H:%M:%S"))
+c4.metric("Last Sync", datetime.now().strftime("%H:%M:%S"))
 
 # Data Preparation
 df = fetch_candles(symbol)
 
-# Format Candlestick Data
+# Format Candlestick & Volume Data
 candle_data = []
 volume_data = []
 for _, row in df.iterrows():
-    candle_data.append({
-        "time": int(row["time"]),
-        "open": float(row["open"]),
-        "high": float(row["high"]),
-        "low": float(row["low"]),
-        "close": float(row["close"])
-    })
-    vol_color = "#26a69a80" if row["close"] >= row["open"] else "#ef535080"
-    volume_data.append({
-        "time": int(row["time"]),
-        "value": float(row["volume"]),
-        "color": vol_color
-    })
+    t_sec = int(row["time"])
+    o = round(float(row["open"]), 2)
+    h = round(float(row["high"]), 2)
+    l = round(float(row["low"]), 2)
+    c = round(float(row["close"]), 2)
+    v = round(float(row["volume"]), 2)
 
-# Format Line Indicators
+    candle_data.append({"time": t_sec, "open": o, "high": h, "low": l, "close": c})
+    vol_color = "rgba(38, 166, 154, 0.55)" if c >= o else "rgba(239, 83, 80, 0.55)"
+    volume_data.append({"time": t_sec, "value": v, "color": vol_color})
+
+# Format Indicators
 indicator_series = []
 for ind in st.session_state.indicators:
     t = ind["type"]
@@ -156,67 +166,79 @@ for ind in st.session_state.indicators:
     line_points = []
     for _, row in df.iterrows():
         val = row[col_name]
-        if not np.isnan(val):
-            line_points.append({"time": int(row["time"]), "value": float(val)})
+        if pd.notna(val):
+            line_points.append({"time": int(row["time"]), "value": round(float(val), 2)})
             
-    indicator_series.append({
-        "name": f"{t} ({p})",
-        "color": c,
-        "data": line_points
-    })
+    if line_points:
+        indicator_series.append({
+            "name": f"{t} ({p})",
+            "color": c,
+            "data": line_points
+        })
 
-# Embedded TradingView Lightweight Chart HTML
+candle_json = json.dumps(candle_data)
+volume_json = json.dumps(volume_data)
+indicators_json = json.dumps(indicator_series)
+
+# HTML/JS with Pinned Lightweight-Charts Version 4.1.1
 tv_chart_html = f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <meta charset="utf-8">
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
-            margin: 0;
-            padding: 0;
             background-color: #131722;
             color: #d1d4dc;
-            font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             overflow: hidden;
+            width: 100%;
+            height: 100vh;
         }}
-        #chart-container {{
+        #chart-wrapper {{
             position: relative;
-            width: 100vw;
+            width: 100%;
             height: 560px;
         }}
-        .watermark {{
+        #chart {{
+            width: 100%;
+            height: 100%;
+        }}
+        .legend {{
             position: absolute;
-            bottom: 8px;
-            left: 12px;
-            z-index: 10;
-            opacity: 0.8;
+            top: 12px;
+            left: 14px;
+            z-index: 20;
             font-size: 13px;
-            font-weight: 700;
-            color: #868993;
+            font-weight: 600;
+            display: flex;
+            gap: 12px;
+            pointer-events: none;
+            background: rgba(19, 23, 34, 0.7);
+            padding: 4px 8px;
+            border-radius: 4px;
+        }}
+        .legend-item {{
             display: flex;
             align-items: center;
-            gap: 5px;
-            pointer-events: none;
+            gap: 4px;
         }}
     </style>
 </head>
 <body>
-    <div id="chart-container">
-        <div class="watermark">
-            <svg width="24" height="16" viewBox="0 0 36 28" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M14 22H7V11H14V22Z" fill="#2962FF"/>
-                <path d="M22 22H15V6H22V22Z" fill="#2962FF"/>
-                <path d="M30 22H23V0H30V22Z" fill="#2962FF"/>
-            </svg>
-            TradingView
+    <div id="chart-wrapper">
+        <div class="legend" id="legend">
+            <span style="color: #2962FF;">{symbol}</span>
         </div>
+        <div id="chart"></div>
     </div>
 
     <script>
-        const container = document.getElementById('chart-container');
-        const chart = LightweightCharts.createChart(container, {{
-            width: container.clientWidth,
+        const chartElement = document.getElementById('chart');
+        const chart = LightweightCharts.createChart(chartElement, {{
+            width: chartElement.clientWidth || window.innerWidth,
             height: 560,
             layout: {{
                 background: {{ color: '#131722' }},
@@ -224,16 +246,14 @@ tv_chart_html = f"""
                 fontSize: 12,
             }},
             grid: {{
-                vertLines: {{ color: '#1f2434' }},
-                horzLines: {{ color: '#1f2434' }},
+                vertLines: {{ color: '#1e2230' }},
+                horzLines: {{ color: '#1e2230' }},
             }},
             crosshair: {{
                 mode: LightweightCharts.CrosshairMode.Normal,
             }},
             rightPriceScale: {{
                 borderColor: '#2B2B43',
-                visible: true,
-                autoScale: true,
                 scaleMargins: {{
                     top: 0.1,
                     bottom: 0.25,
@@ -242,7 +262,7 @@ tv_chart_html = f"""
             timeScale: {{
                 borderColor: '#2B2B43',
                 timeVisible: true,
-                secondsVisible: true,
+                secondsVisible: false,
             }},
         }});
 
@@ -253,42 +273,46 @@ tv_chart_html = f"""
             borderVisible: false,
             wickUpColor: '#26a69a',
             wickDownColor: '#ef5350',
-            priceFormat: {{
-                type: 'price',
-                precision: 2,
-                minMove: 0.01,
-            }},
         }});
-        candleSeries.setData({json.dumps(candle_data)});
+        candleSeries.setData({candle_json});
 
-        // Volume Series (Attached at bottom)
+        // Volume Series
         const volumeSeries = chart.addHistogramSeries({{
             priceFormat: {{ type: 'volume' }},
-            priceScaleId: 'volume',
+            priceScaleId: 'vol_scale',
         }});
-        chart.priceScale('volume').applyOptions({{
+        chart.priceScale('vol_scale').applyOptions({{
             scaleMargins: {{
-                top: 0.78,
+                top: 0.8,
                 bottom: 0.0,
             }},
             visible: false,
         }});
-        volumeSeries.setData({json.dumps(volume_data)});
+        volumeSeries.setData({volume_json});
 
-        // Indicator Lines
-        const indicators = {json.dumps(indicator_series)};
+        // Dynamic Indicators
+        const indicators = {indicators_json};
+        const legend = document.getElementById('legend');
+        
         indicators.forEach(ind => {{
-            const line = chart.addLineSeries({{
+            const lineSeries = chart.addLineSeries({{
                 color: ind.color,
                 lineWidth: 2,
-                title: ind.name,
-                priceLineVisible: true,
+                priceLineVisible: false,
             }});
-            line.setData(ind.data);
+            lineSeries.setData(ind.data);
+
+            const item = document.createElement('div');
+            item.className = 'legend-item';
+            item.innerHTML = `<span style="color:${{ind.color}};">■</span> ${{ind.name}}`;
+            legend.appendChild(item);
         }});
 
+        chart.timeScale().fitContent();
+
+        // Responsive Resizing
         window.addEventListener('resize', () => {{
-            chart.applyOptions({{ width: container.clientWidth }});
+            chart.applyOptions({{ width: chartElement.clientWidth }});
         }});
     </script>
 </body>
@@ -297,10 +321,6 @@ tv_chart_html = f"""
 
 components.html(tv_chart_html, height=580)
 
-# Auto trade signal check
-if st.session_state.auto_trade:
-    st.caption("⚡ Auto Trading Algorithm: Monitoring EMA lines & real-time order books...")
-
-# 1-second auto update loop
-time.sleep(1)
+# Stable auto-refresh interval (2 seconds)
+time.sleep(2)
 st.rerun()
