@@ -9,36 +9,25 @@ import time
 import json
 from datetime import datetime
 
-st.set_page_config(page_title="Delta Range Filter Trader", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Delta Live Trader", page_icon="📈", layout="wide")
 
-# Session State Setup
+# Session States
 if "auto_trade" not in st.session_state:
     st.session_state.auto_trade = False
-
+if "candle_cache" not in st.session_state:
+    st.session_state.candle_cache = {}
+if "last_symbol" not in st.session_state:
+    st.session_state.last_symbol = ""
 if "rf_enabled" not in st.session_state:
     st.session_state.rf_enabled = True
-
-if "rf_period" not in st.session_state:
-    st.session_state.rf_period = 100
-
-if "rf_mult" not in st.session_state:
-    st.session_state.rf_mult = 3.0
-
 if "indicators" not in st.session_state:
     st.session_state.indicators = [
         {"id": 1, "type": "EMA", "param": 9, "color": "#FFEB3B"},
         {"id": 2, "type": "EMA", "param": 21, "color": "#FF9800"}
     ]
 
-# Delta Exchange API Logic
 DELTA_BASE_URL = "https://api.delta.exchange"
-
-# Correct Delta API Symbol Mapping
-SYMBOL_MAPPING = {
-    "BTCUSD": "BTCUSD",
-    "ETHUSD": "ETHUSD",
-    "SOLUSD": "SOLUSDT"
-}
+SYMBOL_MAP = {"BTCUSD": "BTCUSD", "ETHUSD": "ETHUSD", "SOLUSD": "SOLUSDT"}
 
 def get_delta_balance(api_key, api_secret):
     if not api_key or not api_secret:
@@ -63,62 +52,50 @@ def get_delta_balance(api_key, api_secret):
         pass
     return 0.0
 
-def fetch_candles(symbol_choice="BTCUSD", resolution="1m"):
-    target_symbol = SYMBOL_MAPPING.get(symbol_choice, symbol_choice)
-    end_time = int(time.time())
-    start_time = end_time - (3600 * 5)  # 5 hours data
-    
-    url = f"{DELTA_BASE_URL}/v2/chart/history"
-    params = {
-        "symbol": target_symbol,
-        "resolution": resolution,
-        "start": start_time,
-        "end": end_time
-    }
-    
+def get_live_price(symbol):
+    """Real live market mark/spot price from Delta public ticker"""
+    target = SYMBOL_MAP.get(symbol, symbol)
+    url = f"{DELTA_BASE_URL}/v2/tickers/{target}"
     try:
-        res = requests.get(url, params=params, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("success") and data.get("result"):
-                df = pd.DataFrame(data["result"])
-                df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-                df = df.sort_values("time").drop_duplicates(subset=["time"])
-                if len(df) > 10:
-                    return df[["time", "open", "high", "low", "close", "volume"]]
+        res = requests.get(url, timeout=2).json()
+        if res.get("success"):
+            return float(res["result"]["mark_price"])
     except Exception:
         pass
+    return None
 
-    # Symbol-specific realistic base fallback if API call fails or limits
-    default_bases = {"BTCUSD": 68000.0, "ETHUSD": 3500.0, "SOLUSD": 160.0}
-    base_val = default_bases.get(symbol_choice, 1000.0)
+def fetch_candles_once(symbol):
+    """Initial candle history fetch from Delta"""
+    target = SYMBOL_MAP.get(symbol, symbol)
+    end_time = int(time.time())
+    start_time = end_time - (3600 * 3)  # Last 3 hours
+    url = f"{DELTA_BASE_URL}/v2/chart/history?symbol={target}&resolution=1m&start={start_time}&end={end_time}"
+    try:
+        res = requests.get(url, timeout=4).json()
+        if res.get("success") and res.get("result"):
+            df = pd.DataFrame(res["result"])
+            df = df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+            df = df.sort_values("time").drop_duplicates(subset=["time"])
+            return df[["time", "open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
     
-    now = int(time.time()) - 60
-    base_time = now - (150 * 60)
-    times = [base_time + (i * 60) for i in range(150)]
-    
-    np.random.seed(int(time.time()) % 1000)
-    noise = np.cumsum(np.random.randn(150) * (base_val * 0.0008))
-    base_price = base_val + noise
-
-    spread = base_val * 0.001
-    opens = base_price
-    highs = base_price + np.random.uniform(spread * 0.2, spread, 150)
-    lows = base_price - np.random.uniform(spread * 0.2, spread, 150)
-    closes = base_price + np.random.uniform(-spread * 0.5, spread * 0.5, 150)
-    vols = np.random.randint(50, 1200, 150)
-
+    # Stable deterministic fallback if API unavailable (fixed seed, no random shifts)
+    now = (int(time.time()) // 60) * 60
+    times = [now - (i * 60) for i in reversed(range(80))]
+    base = 3500.0 if "ETH" in symbol else (68000.0 if "BTC" in symbol else 160.0)
+    opens = [base + (i * 0.2) for i in range(80)]
     return pd.DataFrame({
         "time": times,
         "open": opens,
-        "high": highs,
-        "low": lows,
-        "close": closes,
-        "volume": vols
+        "high": [x + 2.0 for x in opens],
+        "low": [x - 2.0 for x in opens],
+        "close": opens,
+        "volume": [500] * 80
     })
 
-# --- Range Filter Indicator ---
-def calculate_range_filter(df, per=100, mult=3.0):
+# --- Range Filter Calculation ---
+def calculate_range_filter(df, per=50, mult=2.5):
     src = df['close'].values
     n = len(src)
     if n < 2:
@@ -185,11 +162,11 @@ def calculate_range_filter(df, per=100, mult=3.0):
     df['rf_sell'] = short_condition
     return df
 
-# --- Sidebar Controls ---
+# --- Sidebar UI ---
 st.sidebar.title("⚙️ Delta Config")
 api_key = st.sidebar.text_input("Delta API Key", type="password")
 api_secret = st.sidebar.text_input("Delta API Secret", type="password")
-symbol = st.sidebar.selectbox("Symbol", ["BTCUSD", "ETHUSD", "SOLUSD"])
+symbol = st.sidebar.selectbox("Symbol", ["ETHUSD", "BTCUSD", "SOLUSD"])
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 Bot Status")
@@ -200,18 +177,12 @@ else:
     st.sidebar.info("○ BOT PAUSED")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Range Filter Indicator")
+st.sidebar.subheader("🎯 Indicator Settings")
 st.session_state.rf_enabled = st.sidebar.checkbox("Enable Range Filter", value=st.session_state.rf_enabled)
-if st.session_state.rf_enabled:
-    st.session_state.rf_period = st.sidebar.number_input("Sampling Period", min_value=1, max_value=300, value=st.session_state.rf_period)
-    st.session_state.rf_mult = st.sidebar.number_input("Range Multiplier", min_value=0.1, max_value=10.0, value=st.session_state.rf_mult, step=0.1)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("📈 Additional Indicators")
-
-with st.sidebar.expander("➕ Add EMA / SMA", expanded=False):
+with st.sidebar.expander("➕ Add EMA / SMA"):
     ind_type = st.selectbox("Type", ["EMA", "SMA"])
-    ind_param = st.number_input("Length", min_value=2, max_value=200, value=20)
+    ind_param = st.number_input("Period", 2, 200, 20)
     ind_color = st.color_picker("Color", "#00E676")
     if st.button("Add Indicator", use_container_width=True):
         st.session_state.indicators.append({
@@ -229,39 +200,73 @@ for idx, ind in enumerate(st.session_state.indicators):
         st.session_state.indicators.pop(idx)
         st.rerun()
 
-# --- Main Dashboard ---
+# --- Candle Cache & Live Candle Building ---
+if st.session_state.last_symbol != symbol or symbol not in st.session_state.candle_cache:
+    st.session_state.candle_cache[symbol] = fetch_candles_once(symbol)
+    st.session_state.last_symbol = symbol
+
+df = st.session_state.candle_cache[symbol].copy()
+
+# Live Price Fetch & Tick Update
+current_price = get_live_price(symbol)
+current_time_min = (int(time.time()) // 60) * 60
+
+if current_price is not None and len(df) > 0:
+    last_idx = df.index[-1]
+    last_time = int(df.loc[last_idx, "time"])
+
+    if current_time_min > last_time:
+        # 1-minute close hui: nayi candle shuru karo
+        new_row = pd.DataFrame([{
+            "time": current_time_min,
+            "open": current_price,
+            "high": current_price,
+            "low": current_price,
+            "close": current_price,
+            "volume": 10.0
+        }])
+        df = pd.concat([df, new_row], ignore_index=True)
+    else:
+        # Current minute ki live candle update karo
+        df.loc[last_idx, "close"] = current_price
+        if current_price > df.loc[last_idx, "high"]:
+            df.loc[last_idx, "high"] = current_price
+        if current_price < df.loc[last_idx, "low"]:
+            df.loc[last_idx, "low"] = current_price
+        df.loc[last_idx, "volume"] += 1.0
+
+    st.session_state.candle_cache[symbol] = df
+
+# Top Status Metrics
 bal = get_delta_balance(api_key, api_secret)
 c1, c2, c3, c4 = st.columns(4)
+live_disp = f"${current_price:,.2f}" if current_price else f"${df['close'].iloc[-1]:,.2f}"
 c1.metric("Wallet Balance", f"${bal:,.2f} USDT")
-c2.metric("Pair", symbol)
+c2.metric("Pair (Live Price)", f"{symbol} : {live_disp}")
 c3.metric("Auto Trade", "ON" if st.session_state.auto_trade else "OFF")
-c4.metric("Last Sync", datetime.now().strftime("%H:%M:%S"))
+c4.metric("Last Candle Tick", datetime.now().strftime("%H:%M:%S"))
 
-# Candle & Indicator Preparation
-df = fetch_candles(symbol)
-
-# Calculate Range Filter if enabled
+# Indicator Processing
 if st.session_state.rf_enabled:
-    df = calculate_range_filter(df, per=st.session_state.rf_period, mult=st.session_state.rf_mult)
+    df = calculate_range_filter(df, per=50, mult=2.5)
 
 candle_data = []
 volume_data = []
 markers_data = []
 
-precision = 2 if symbol != "SOLUSD" else 3
-
 for _, row in df.iterrows():
     t_sec = int(row["time"])
-    o = round(float(row["open"]), precision)
-    h = round(float(row["high"]), precision)
-    l = round(float(row["low"]), precision)
-    c = round(float(row["close"]), precision)
+    o = round(float(row["open"]), 2)
+    h = round(float(row["high"]), 2)
+    l = round(float(row["low"]), 2)
+    c = round(float(row["close"]), 2)
     v = round(float(row["volume"]), 2)
 
     candle_data.append({"time": t_sec, "open": o, "high": h, "low": l, "close": c})
     vol_color = "rgba(38, 166, 154, 0.55)" if c >= o else "rgba(239, 83, 80, 0.55)"
     volume_data.append({"time": t_sec, "value": v, "color": vol_color})
 
+    # Markers (Buy/Sell sirf 1-candle confirmed point par dikhega)
     if st.session_state.rf_enabled:
         if row.get('rf_buy'):
             markers_data.append({
@@ -296,7 +301,7 @@ for ind in st.session_state.indicators:
     for _, row in df.iterrows():
         val = row[col_name]
         if pd.notna(val):
-            line_points.append({"time": int(row["time"]), "value": round(float(val), precision)})
+            line_points.append({"time": int(row["time"]), "value": round(float(val), 2)})
             
     if line_points:
         indicator_series.append({
@@ -311,19 +316,19 @@ if st.session_state.rf_enabled and 'rf_filt' in df:
         "name": "Range Filter",
         "color": "#90bff9",
         "lineWidth": 2,
-        "data": [{"time": int(r["time"]), "value": round(float(r["rf_filt"]), precision)} for _, r in df.iterrows() if pd.notna(r["rf_filt"])]
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_filt"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_filt"])]
     })
     rf_series.append({
         "name": "High Target",
-        "color": "rgba(255, 255, 255, 0.5)",
+        "color": "rgba(255, 255, 255, 0.4)",
         "lineWidth": 1,
-        "data": [{"time": int(r["time"]), "value": round(float(r["rf_hband"]), precision)} for _, r in df.iterrows() if pd.notna(r["rf_hband"])]
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_hband"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_hband"])]
     })
     rf_series.append({
         "name": "Low Target",
-        "color": "rgba(41, 98, 255, 0.5)",
+        "color": "rgba(41, 98, 255, 0.4)",
         "lineWidth": 1,
-        "data": [{"time": int(r["time"]), "value": round(float(r["rf_lband"]), precision)} for _, r in df.iterrows() if pd.notna(r["rf_lband"])]
+        "data": [{"time": int(r["time"]), "value": round(float(r["rf_lband"]), 2)} for _, r in df.iterrows() if pd.notna(r["rf_lband"])]
     })
 
 candle_json = json.dumps(candle_data)
@@ -331,9 +336,6 @@ volume_json = json.dumps(volume_data)
 markers_json = json.dumps(markers_data)
 indicators_json = json.dumps(indicator_series)
 rf_json = json.dumps(rf_series)
-
-# Unique ID so the chart always forces full re-render on symbol or data changes
-chart_div_id = f"chart_{symbol}_{int(time.time())}"
 
 tv_chart_html = f"""
 <!DOCTYPE html>
@@ -356,7 +358,7 @@ tv_chart_html = f"""
             width: 100%;
             height: 560px;
         }}
-        #{chart_div_id} {{
+        #chart {{
             width: 100%;
             height: 100%;
         }}
@@ -375,23 +377,18 @@ tv_chart_html = f"""
             border-radius: 4px;
             flex-wrap: wrap;
         }}
-        .legend-item {{
-            display: flex;
-            align-items: center;
-            gap: 4px;
-        }}
     </style>
 </head>
 <body>
     <div id="chart-wrapper">
         <div class="legend" id="legend">
-            <span style="color: #2962FF; font-weight: bold;">{symbol}</span>
+            <span style="color: #2962FF; font-weight: bold;">{symbol} : {live_disp}</span>
         </div>
-        <div id="{chart_div_id}"></div>
+        <div id="chart"></div>
     </div>
 
     <script>
-        const chartElement = document.getElementById('{chart_div_id}');
+        const chartElement = document.getElementById('chart');
         const chart = LightweightCharts.createChart(chartElement, {{
             width: chartElement.clientWidth || window.innerWidth,
             height: 560,
@@ -421,35 +418,27 @@ tv_chart_html = f"""
             }},
         }});
 
-        // Candlestick Series
         const candleSeries = chart.addCandlestickSeries({{
             upColor: '#26a69a',
             downColor: '#ef5350',
             borderVisible: false,
             wickUpColor: '#26a69a',
             wickDownColor: '#ef5350',
-            priceFormat: {{
-                type: 'price',
-                precision: {precision},
-                minMove: {0.01 if precision == 2 else 0.001}
-            }}
         }});
         candleSeries.setData({candle_json});
 
-        // Set Markers (BUY/SELL labels)
         const markers = {markers_json};
         if (markers && markers.length > 0) {{
             candleSeries.setMarkers(markers);
         }}
 
-        // Volume Series
         const volumeSeries = chart.addHistogramSeries({{
             priceFormat: {{ type: 'volume' }},
             priceScaleId: 'vol_scale',
         }});
         chart.priceScale('vol_scale').applyOptions({{
             scaleMargins: {{
-                top: 0.8,
+                top: 0.82,
                 bottom: 0.0,
             }},
             visible: false,
@@ -458,7 +447,6 @@ tv_chart_html = f"""
 
         const legend = document.getElementById('legend');
 
-        // Range Filter Lines
         const rfLines = {rf_json};
         rfLines.forEach(item => {{
             const rLine = chart.addLineSeries({{
@@ -467,14 +455,11 @@ tv_chart_html = f"""
                 priceLineVisible: false,
             }});
             rLine.setData(item.data);
-
             const div = document.createElement('div');
-            div.className = 'legend-item';
             div.innerHTML = `<span style="color:${{item.color}};">■</span> ${{item.name}}`;
             legend.appendChild(div);
         }});
 
-        // Dynamic Indicators
         const indicators = {indicators_json};
         indicators.forEach(ind => {{
             const lineSeries = chart.addLineSeries({{
@@ -483,14 +468,12 @@ tv_chart_html = f"""
                 priceLineVisible: false,
             }});
             lineSeries.setData(ind.data);
-
             const item = document.createElement('div');
-            item.className = 'legend-item';
             item.innerHTML = `<span style="color:${{ind.color}};">■</span> ${{ind.name}}`;
             legend.appendChild(item);
         }});
 
-        chart.timeScale().fitContent();
+        chart.timeScale().scrollToPosition(5, false);
 
         window.addEventListener('resize', () => {{
             chart.applyOptions({{ width: chartElement.clientWidth }});
@@ -500,19 +483,16 @@ tv_chart_html = f"""
 </html>
 """
 
-# Dynamic HTML render without invalid 'key' argument
 components.html(tv_chart_html, height=580)
 
-# --- Auto Trading Signal Alerts ---
+# Trade Toast Signal
 if st.session_state.auto_trade and st.session_state.rf_enabled and len(df) > 1:
-    last_candle = df.iloc[-1]
-    prev_candle = df.iloc[-2]
-    
-    if last_candle.get("rf_buy") or prev_candle.get("rf_buy"):
-        st.toast(f"🚀 RANGE FILTER BUY SIGNAL ON {symbol}!", icon="🟢")
-    elif last_candle.get("rf_sell") or prev_candle.get("rf_sell"):
-        st.toast(f"🔻 RANGE FILTER SELL SIGNAL ON {symbol}!", icon="🔴")
+    last_c = df.iloc[-1]
+    if last_c.get("rf_buy"):
+        st.toast(f"🟢 RANGE FILTER BUY SIGNAL ON {symbol} @ {live_disp}")
+    elif last_c.get("rf_sell"):
+        st.toast(f"🔴 RANGE FILTER SELL SIGNAL ON {symbol} @ {live_disp}")
 
-# Refresh Interval
-time.sleep(2)
+# Real-time refresh loop (1 second update)
+time.sleep(1)
 st.rerun()
